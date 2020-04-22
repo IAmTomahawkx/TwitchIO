@@ -28,7 +28,8 @@ import inspect
 import itertools
 import sys
 import traceback
-from typing import Callable, Optional, Union
+import warnings
+from typing import Callable, Optional, Union, Dict
 from twitchio.channel import Channel
 from twitchio.client import Client
 from twitchio.websocket import WSConnection
@@ -61,7 +62,7 @@ class Bot(Client):
 
         self._modules = {}
         self._cogs = {}
-        self._events = {}
+        self._events: Dict[list] = {}
         self._checks = []
 
         self.__init__commands__()
@@ -195,42 +196,52 @@ class Bot(Client):
         if not context.prefix:
             return
 
+        async def try_run(func, *, to_command=False):
+            try:
+                await func
+            except Exception as _e:
+                if not to_command:
+                    self.run_event("error", _e)
+                else:
+                    self.run_event("command_error", context, _e)
+
         check_result = await self.handle_checks(context)
 
         if check_result is not True:
-            return await self.event_command_error(context, check_result)
+            self.run_event("command_error", context, check_result)
+            return
 
         limited = self._run_cooldowns(context)
 
         if limited:
-            return await self.event_command_error(context, limited[0])
+            self.run_event("command_error", context, limited[0])
+            return
 
         instance = context.command._instance
+        if instance:
+            args = [instance, context]
+        else:
+            args = [context]
+
+        await try_run(self.global_before_invoke(context))
+
+        if context.command._before_invoke:
+            await try_run(context.command._before_invoke(*args), to_command=True)
 
         try:
-            await self.global_before_invoke(context)
-
-            if context.command._before_invoke:
-                await context.command._before_invoke(instance, context)
-
-            if instance:
-                await context.command._callback(instance, context, *context.args, **context.kwargs)
-            else:
-                await context.command._callback(context, *context.args, **context.kwargs)
+            await context.command._callback(*args, *context.args, **context.kwargs)
 
         except Exception as e:
             if context.command.event_error:
-                await context.command.on_error(instance, context, e)
+                await try_run(context.command.event_error(*args, e))
 
-            await self.event_command_error(context, e)
+            self.run_event("command_error", context, e)
 
-        try:
-            # Invoke our after command hooks...
-            if context.command._after_invoke:
-                await context.command._after_invoke(context)
-            await self.global_after_invoke(context)
-        except Exception as e:
-            await self.event_command_error(context, e)
+        # Invoke our after command hooks...
+        if context.command._after_invoke:
+            await try_run(context.command._after_invoke(*args), to_command=True)
+
+        await try_run(self.global_after_invoke(context))
 
     def _run_cooldowns(self, context):
         try:
@@ -283,7 +294,7 @@ class Bot(Client):
             The name of the module to load in dot.path format.
         """
         if name in self._modules:
-            return
+            raise ValueError(f"Module <{name}> is already loaded")
 
         module = importlib.import_module(name)
 
@@ -294,8 +305,68 @@ class Bot(Client):
             del sys.modules[name]
             raise ImportError(f'Module <{name}> is missing a prepare method')
 
+        self._modules[name] = module
+
+    def unload_module(self, name: str):
         if name not in self._modules:
+            raise ValueError(f"Module <{name}> is not loaded")
+
+        module = self._modules.pop(name)
+        if hasattr(module, "breakdown"):
+            module.breakdown(self)
+
+        to_delete = [cog_name for cog_name, cog in self._cogs.items() if cog.__module__ == module]
+        for name in to_delete:
+            self.remove_cog(name)
+
+        # just in case they aren't in cogs
+        to_delete = [name for name, cmd in self._commands if cmd._callback.__module__ == module]
+        for name in to_delete:
+            del self._commands[name]
+
+        to_delete = [name for name, cmd in self._command_aliases if cmd._callback.__module__ == module]
+        for name in to_delete:
+            del self._command_aliases[name]
+
+    def reload_module(self, name: str):
+        if name not in self._modules:
+            raise ValueError(f"Module <{name}> is not loaded")
+
+        commands = {}
+        aliases = {}
+        cogs = {}
+
+        module = self._modules.pop(name)
+        to_pop = []
+        for name, cog in self._cogs:
+            if cog.__module__ == module:
+                cogs[name] = cog
+            to_pop.append(name)
+
+        for name in to_pop:
+            del self._cogs[name]
+
+        # remove commands
+        to_delete = [(name, cmd) for name, cmd in self._commands if cmd._callback.__module__ == module]
+        for name, cmd in to_delete:
+            commands[name] = cmd
+            del self._commands[name]
+
+        to_delete = [(name, cmd) for name, cmd in self._command_aliases if cmd._callback.__module__ == module]
+        for name, cmd in to_delete:
+            aliases[name] = cmd
+            del self._command_aliases[name]
+
+        del sys.modules[name]
+        try:
+            self.load_module(name)
+        except:
+            sys.modules[name] = module
             self._modules[name] = module
+            self._command_aliases.update(aliases)
+            self._commands.update(commands)
+            self._cogs.update(cogs)
+            raise
 
     def add_cog(self, cog):
         if not isinstance(cog, Cog):
@@ -306,6 +377,19 @@ class Bot(Client):
 
         cog._load_methods(self)
         self._cogs[cog.name] = cog
+
+    def remove_cog(self, cog_name: str):
+        if cog_name not in self._cogs:
+            raise InvalidCog(f"Cog '{cog_name}' not found")
+
+        cog = self._cogs.pop(cog_name)
+        to_remove = [name for name, cmd in self._commands.items() if cmd.cog is not None and cmd.cog.name == cog.name]
+        for name in to_remove:
+            del self._commands[name]
+
+        to_remove = [name for name, cmd in self._command_aliases if cmd.cog is not None and cmd.cog.name == cog.name]
+        for name in to_remove:
+            del self._command_aliases[name]
 
     async def global_before_invoke(self, ctx):
         """|coro|
@@ -357,8 +441,54 @@ class Bot(Client):
         """
         pass
 
-    def add_event(self):
-        pass
+    def run_event(self, name, *args, **kwargs):
+        async def wrapped(func):
+            try:
+                await func(*args, **kwargs)
+            except Exception as e:
+                self.run_event("error", e)
+
+        inner_cb = getattr(self, name, None)
+        if inner_cb is not None:
+            if inspect.iscoroutine(inner_cb):
+                self.loop.create_task(wrapped(inner_cb))
+            else:
+                warnings.warn(f"event '{name}' callback is not a coroutine", category=RuntimeWarning)
+
+        if name in self._events:
+            for event in self._events[name]:
+                self.loop.create_task(wrapped(event))
+
+    def event(self, name: str = None) -> Callable:
+
+        def decorator(func: Callable) -> Callable:
+            self.add_event(func, name)
+            return func
+
+        return decorator
+
+    def add_event(self, callback: Callable, name: str = None) -> None:
+        if not inspect.iscoroutine(callback):
+            raise ValueError("callback must be a coroutine")
+
+        event_name = name or callback.__name__
+        callback._event = event_name  # used to remove the event
+
+        if event_name in self._events:
+            self._events[event_name].append(callback)
+
+        else:
+            self._events[event_name] = [callback]
+
+    def remove_event(self, callback: Callable) -> bool:
+        if not hasattr(callback, "_event"):
+            raise ValueError("callback is not a registered event")
+
+        if callback in self._events[callback._event]:
+            self._events[callback._event].remove(callback)
+            return True
+
+        return False
 
     @property
     def nick(self):
